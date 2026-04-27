@@ -196,9 +196,6 @@ class Sound:
     def __init__(self, name, path, keybind=None, keybind_raw=None,
                  volume=1.0, start_sec=0.0, end_sec=-1.0,
                  folder_assignments: Optional[Dict[str, Dict]] = None):
-        """
-        folder_assignments: dict {folder_name: {'keybind': str, 'keybind_raw': str}}
-        """
         self.name = name
         self.path = path
         self.keybind = keybind
@@ -206,7 +203,6 @@ class Sound:
         self.volume = volume
         self.start_sec = start_sec
         self.end_sec = end_sec
-        # folder -> { 'keybind': display, 'keybind_raw': raw }
         self.folder_assignments = folder_assignments if folder_assignments is not None else {}
 
     def has_folder(self, folder: str) -> bool:
@@ -246,6 +242,8 @@ class AudioRouter:
         self._sfx_buf=np.zeros((0,2),dtype="float32")
         self._sfx_lock=threading.Lock()
         self._active_plays={}; self._play_lock=threading.Lock()
+        # Serialise stop+play sequences so rapid switches don't race
+        self._play_serial_lock = threading.Lock()
 
     def get_output_devices(self):
         return[(i,d["name"])for i,d in enumerate(sd.query_devices())if d["max_output_channels"]>0]
@@ -324,13 +322,20 @@ class AudioRouter:
     def set_output_device(self,d): self.virtual_device=d
     def set_input_device(self,d): self.mic_device=d
 
-    def play_sound(self,path,volume=1.0,start_sec=0.0,end_sec=-1.0):
+    def play_sound(self, path, volume=1.0, start_sec=0.0, end_sec=-1.0):
+        """Stop any existing play of this path, then start a new one."""
         with self._play_lock:
-            if path in self._active_plays: self._active_plays[path].set()
-        stop_evt=threading.Event()
-        t=threading.Thread(target=self._play_thread,args=(path,volume,start_sec,end_sec,stop_evt),daemon=True)
+            if path in self._active_plays:
+                self._active_plays[path].set()
+        stop_evt = threading.Event()
+        t = threading.Thread(
+            target=self._play_thread,
+            args=(path, volume, start_sec, end_sec, stop_evt),
+            daemon=True
+        )
         t.start()
-        with self._play_lock: self._active_plays[path]=stop_evt
+        with self._play_lock:
+            self._active_plays[path] = stop_evt
         return stop_evt
 
     def _load_sound(self,path,volume,start_sec,end_sec):
@@ -349,50 +354,86 @@ class AudioRouter:
         if peak>0.95: segment=segment*(0.95/peak)
         return segment.astype("float32")
 
-    def _play_thread(self,path,volume,start_sec,end_sec,stop_evt):
+    def _play_thread(self, path, volume, start_sec, end_sec, stop_evt):
         try:
-            data=self._load_sound(path,volume,start_sec,end_sec)
-            if stop_evt.is_set(): return
+            # Load audio first (can be slow for large files)
+            data = self._load_sound(path, volume, start_sec, end_sec)
+
+            # Bail out immediately if we were already cancelled
+            if stop_evt.is_set():
+                return
+
             if self.passthrough_active:
                 with self._sfx_lock:
-                    self._sfx_buf=(np.vstack([self._sfx_buf,data])if len(self._sfx_buf)else data.copy())
-                dur=len(data)/SAMPLE_RATE; deadline=time.monotonic()+dur+0.2
-                while time.monotonic()<deadline and not stop_evt.is_set(): time.sleep(0.05)
+                    self._sfx_buf = (
+                        np.vstack([self._sfx_buf, data])
+                        if len(self._sfx_buf) else data.copy()
+                    )
+                dur = len(data) / SAMPLE_RATE
+                deadline = time.monotonic() + dur + 0.2
+                while time.monotonic() < deadline and not stop_evt.is_set():
+                    time.sleep(0.05)
                 if stop_evt.is_set():
-                    with self._sfx_lock: self._sfx_buf=np.zeros((0,2),dtype="float32")
+                    with self._sfx_lock:
+                        self._sfx_buf = np.zeros((0, 2), dtype="float32")
             else:
-                dev=self.virtual_device
-                if dev is not None: sd.play(data,SAMPLE_RATE,device=dev,blocking=False)
-                else: sd.play(data,SAMPLE_RATE,blocking=False)
-                dur=len(data)/SAMPLE_RATE; t0=time.monotonic()
-                while not stop_evt.is_set()and(time.monotonic()-t0)<dur: time.sleep(0.05)
+                # One final check before touching the audio device so a rapid
+                # stop+play cycle cannot sneak a stale play through.
                 if stop_evt.is_set():
-                    try: sd.stop()
-                    except: pass
-        except Exception as ex: print(f"[AudioRouter] play error: {ex}")
+                    return
+                dev = self.virtual_device
+                try:
+                    if dev is not None:
+                        sd.play(data, SAMPLE_RATE, device=dev, blocking=False)
+                    else:
+                        sd.play(data, SAMPLE_RATE, blocking=False)
+                except Exception as ex:
+                    print(f"[AudioRouter] sd.play error: {ex}")
+                    return
+                dur = len(data) / SAMPLE_RATE
+                t0 = time.monotonic()
+                while not stop_evt.is_set() and (time.monotonic() - t0) < dur:
+                    time.sleep(0.05)
+                if stop_evt.is_set():
+                    try:
+                        sd.stop()
+                    except Exception:
+                        pass
+        except Exception as ex:
+            print(f"[AudioRouter] play error: {ex}")
         finally:
             with self._play_lock:
-                if self._active_plays.get(path)is stop_evt: del self._active_plays[path]
+                if self._active_plays.get(path) is stop_evt:
+                    del self._active_plays[path]
 
-    def stop_sound_by_path(self,path):
-        with self._play_lock: ev=self._active_plays.get(path)
-        if ev: ev.set()
+    def stop_sound_by_path(self, path):
+        with self._play_lock:
+            ev = self._active_plays.get(path)
+        if ev:
+            ev.set()
 
     def stop_all_sounds(self):
-        with self._play_lock: evs=list(self._active_plays.values()); self._active_plays.clear()
-        for ev in evs: ev.set()
-        with self._sfx_lock: self._sfx_buf=np.zeros((0,2),dtype="float32")
+        with self._play_lock:
+            evs = list(self._active_plays.values())
+            self._active_plays.clear()
+        for ev in evs:
+            ev.set()
+        with self._sfx_lock:
+            self._sfx_buf = np.zeros((0, 2), dtype="float32")
         if not self.passthrough_active:
-            try: sd.stop()
-            except: pass
+            try:
+                sd.stop()
+            except Exception:
+                pass
 
     def stop_all_and_wait(self, timeout=0.12):
         """Stop all sounds then wait briefly so the audio device fully releases."""
         self.stop_all_sounds()
         time.sleep(timeout)
 
-    def is_playing(self,path):
-        with self._play_lock: ev=self._active_plays.get(path)
+    def is_playing(self, path):
+        with self._play_lock:
+            ev = self._active_plays.get(path)
         return ev is not None and not ev.is_set()
 
 # ─── WAVEFORM WIDGET ─────────────────────────────────────────────────────────
@@ -599,24 +640,49 @@ class HotkeyCapture(QWidget):
     def _norm(self,key): return key.replace('left ','').replace('right ','')
 
     def _hook_loop(self):
+        # Используем scan codes — они не зависят от раскладки клавиатуры.
+        _pressed_sc: set  = set()   # scan codes зажатых клавиш
+        _seq_sc:     list = []      # порядок scan codes (для raw-строки)
+        _seq_names:  list = []      # названия клавиш (для отображения)
+
         def handler(ev):
-            if not self._running: return
-            key=ev.name.lower()
-            if key=='esc': self._running=False; self._upd_disp.emit(f"— {tr('assign')} —"); return
-            norm=self._norm(key)
-            if ev.event_type=='down':
-                if norm not in self._pressed: self._pressed.add(norm); self._seq.append(norm)
-                self._upd_disp.emit("🎹 "+" + ".join(k.upper()for k in self._seq))
-            elif ev.event_type=='up':
-                if norm in self._pressed: self._pressed.remove(norm)
-                if not self._pressed and self._seq and self._running:
-                    raw="+".join(self._seq); disp=" + ".join(k.upper()for k in self._seq)
-                    self._running=False; self._upd_disp.emit(disp); self.captured.emit(disp,raw)
+            if not self._running:
+                return
+            key = ev.name.lower() if ev.name else ""
+            if key == 'esc':
+                self._running = False
+                self._upd_disp.emit(f"— {tr('assign')} —")
+                return
+            sc = ev.scan_code
+            if not sc:      # игнорируем события без валидного scan code
+                return
+            norm = self._norm(key) if key else str(sc)
+
+            if ev.event_type == 'down':
+                if sc not in _pressed_sc:
+                    _pressed_sc.add(sc)
+                    _seq_sc.append(sc)
+                    _seq_names.append(norm)
+                self._upd_disp.emit("🎹 " + " + ".join(k.upper() for k in _seq_names))
+            elif ev.event_type == 'up':
+                if sc in _pressed_sc:
+                    _pressed_sc.remove(sc)
+                if not _pressed_sc and _seq_sc and self._running:
+                    # raw = combo из scan codes, напр. "57+30"
+                    raw  = "+".join(str(s) for s in _seq_sc)
+                    disp = " + ".join(k.upper() for k in _seq_names)
+                    self._running = False
+                    self._upd_disp.emit(disp)
+                    self.captured.emit(disp, raw)
+
         keyboard.hook(handler)
-        while self._running: time.sleep(0.01)
+        while self._running:
+            time.sleep(0.01)
         keyboard.unhook(handler)
         if self._listening:
-            self._listening=False; self.btn_assign.setVisible(True); self.btn_cancel.setVisible(False)
+            self._listening = False
+            self.btn_assign.setVisible(True)
+            self.btn_cancel.setVisible(False)
 
     def _on_upd(self,text):
         self.key_lbl.setText(text); active=self._running or self._listening
@@ -692,16 +758,16 @@ class SettingsDialog(QDialog):
 
 # ─── LIBRARY TREE ────────────────────────────────────────────────────────────
 class LibraryTree(QTreeWidget):
-    soundFolderChanged  = pyqtSignal(int,str)   # sound index, folder name (add to folder)
-    viewChanged         = pyqtSignal(str,str)   # type (all/folder), folder name
-    soundSelected       = pyqtSignal(int, str)  # sound index, folder name (empty if from "All Sounds")
+    soundFolderChanged  = pyqtSignal(int,str)
+    viewChanged         = pyqtSignal(str,str)
+    soundSelected       = pyqtSignal(int, str)
     folderRenameReq     = pyqtSignal(str)
     folderDeleteReq     = pyqtSignal(str)
     soundRenameReq      = pyqtSignal(int)
     soundTrimReq        = pyqtSignal(int)
     soundDeleteReq      = pyqtSignal(int)
-    soundRemFolderReq   = pyqtSignal(int, str)   # sound index, folder name (remove from that folder)
-    soundAddFolderReq   = pyqtSignal(int)        # show add to folder menu
+    soundRemFolderReq   = pyqtSignal(int, str)
+    soundAddFolderReq   = pyqtSignal(int)
     newFolderReq        = pyqtSignal()
 
     def __init__(self,parent=None):
@@ -724,24 +790,20 @@ class LibraryTree(QTreeWidget):
 
     def rebuild(self,sounds,folders,folder_colors,active_type,active_folder):
         self.clear()
-        # "All Sounds" item
         all_item=QTreeWidgetItem(self)
         all_item.setText(0,f"  📚 {tr('all_sounds')}  ({len(sounds)})")
         all_item.setData(0,ROLE_TYPE,ITEM_ALL); all_item.setData(0,ROLE_IDX,"")
         all_item.setFont(0,QFont("Segoe UI",10,QFont.Weight.Bold))
         all_item.setForeground(0,QColor(T.CYAN)); all_item.setExpanded(True)
         all_item.setToolTip(0,tr("drag_tip"))
-        # all sounds directly under "All Sounds"
         for i,s in enumerate(sounds):
             child=QTreeWidgetItem(all_item)
             kb_txt=f"  [{s.keybind}]" if s.keybind else ""
             child.setText(0,f"    {s.name}{kb_txt}")
             child.setData(0,ROLE_TYPE,ITEM_SOUND); child.setData(0,ROLE_IDX,i)
             child.setToolTip(0,s.path)
-        # Folder items
         for fname in folders:
             col=folder_colors.get(fname,T.ACCENT)
-            # sounds that belong to this folder
             fsounds = [(i,s) for i,s in enumerate(sounds) if s.has_folder(fname)]
             fi=QTreeWidgetItem(self)
             fi.setText(0,f"  📁 {fname}  ({len(fsounds)})")
@@ -751,18 +813,15 @@ class LibraryTree(QTreeWidget):
             for gi,s in fsounds:
                 child=QTreeWidgetItem(fi)
                 label=f"    {s.name}"
-                # show folder-specific hotkey if exists for this folder
                 fhk,_ = s.get_folder_hotkey(fname)
                 if fhk:
                     label += f"  [📁{fhk}]"
                 child.setText(0,label)
                 child.setData(0,ROLE_TYPE,ITEM_SOUND); child.setData(0,ROLE_IDX,gi)
                 child.setToolTip(0,s.path)
-        # "New folder" item
         nf=QTreeWidgetItem(self); nf.setText(0,f"  ＋ {tr('new_folder')}")
         nf.setData(0,ROLE_TYPE,"new_folder")
         nf.setForeground(0,QColor(T.TEXTDD))
-        # restore selection
         self._restore_selection(active_type,active_folder)
 
     def _restore_selection(self,active_type,active_folder):
@@ -921,8 +980,8 @@ class SoundCard(QFrame):
 
 # ─── MAIN WINDOW ─────────────────────────────────────────────────────────────
 class SoundpadApp(QMainWindow):
-    _hotkey_signal      = pyqtSignal(int)            # global hotkey (sound index)
-    _folder_hk_signal   = pyqtSignal(int, str)       # (sound index, folder name)
+    _hotkey_signal      = pyqtSignal(int)
+    _folder_hk_signal   = pyqtSignal(int, str)
     _hotkey_next_sig    = pyqtSignal()
     _hotkey_prev_sig    = pyqtSignal()
     _hotkey_stop_sig    = pyqtSignal()
@@ -932,8 +991,8 @@ class SoundpadApp(QMainWindow):
         super().__init__()
         self.router=AudioRouter(); self.sounds:list[Sound]=[]
         self.folders:list[str]=[]; self.folder_colors:dict[str,str]={}
-        self.keybinds:dict[str,int]={}          # raw -> sound_idx (global)
-        self.folder_keybinds:dict[str,tuple[int,str]]={}   # raw -> (sound_idx, folder)
+        self.keybinds:dict[str,int]={}
+        self.folder_keybinds:dict[str,tuple[int,str]]={}
         self.settings=AppSettings()
         self.selected:int|None=None; self._cards:list[SoundCard]=[]
         self._active_type=ITEM_ALL; self._active_folder=""
@@ -990,10 +1049,8 @@ class SoundpadApp(QMainWindow):
         try:
             with open(CONFIG_FILE)as f: cfg=json.load(f)
         except: return
-        # Load sounds
         self.sounds=[]
         for s_dict in cfg.get("sounds",[]):
-            # Convert old single-folder format if needed
             folder_assignments = s_dict.get("folder_assignments", {})
             if not folder_assignments and "folder" in s_dict and s_dict["folder"]:
                 folder = s_dict["folder"]
@@ -1009,7 +1066,6 @@ class SoundpadApp(QMainWindow):
             self.sounds.append(sound)
         self.folders=cfg.get("folders",[])
         self.folder_colors=cfg.get("folder_colors",{})
-        # rebuild dictionaries
         self.keybinds={}
         self.folder_keybinds={}
         for i,s in enumerate(self.sounds):
@@ -1060,39 +1116,106 @@ class SoundpadApp(QMainWindow):
     # ─── HOTKEYS ─────────────────────────────────────────────────────────────
     def _register_hotkeys(self):
         keyboard.unhook_all()
-        # Global per-sound hotkeys
-        for raw,idx in self.keybinds.items():
-            try: keyboard.add_hotkey(raw, self._hotkey_signal.emit, args=(idx,))
-            except Exception as e: print(f"[Hotkey] {raw}: {e}")
-        # Folder-scoped hotkeys (sound, folder pair)
+
+        # Словарь: frozenset(scan_codes) -> callable
+        self._sc_hotkey_map: dict    = {}
+        self._pressed_sc:    set     = set()
+        self._last_fired_sc: frozenset = frozenset()
+
+        def _is_sc(raw: str) -> bool:
+            """True если raw — набор scan codes, напр. '57+30'."""
+            return bool(raw) and all(p.isdigit() for p in raw.split("+"))
+
+        def _add(raw: str, cb):
+            if _is_sc(raw):
+                # Новый формат: физические scan codes → не зависит от раскладки
+                self._sc_hotkey_map[frozenset(int(p) for p in raw.split("+"))] = cb
+            else:
+                # Старый формат из сохранённых конфигов: имена клавиш
+                try:
+                    keyboard.add_hotkey(raw, cb)
+                except Exception as e:
+                    print(f"[Hotkey legacy] {raw}: {e}")
+
+        for raw, idx in self.keybinds.items():
+            _add(raw, lambda _i=idx: self._hotkey_signal.emit(_i))
+
         for raw, (idx, folder) in self.folder_keybinds.items():
             if raw not in self.keybinds:
-                try: keyboard.add_hotkey(raw, self._folder_hk_signal.emit, args=(idx, folder))
-                except Exception as e: print(f"[FolderHotkey] {raw}: {e}")
-        # Navigation
+                _add(raw, lambda _i=idx, _f=folder: self._folder_hk_signal.emit(_i, _f))
+
         if self.settings.hotkey_next_raw:
-            try: keyboard.add_hotkey(self.settings.hotkey_next_raw, self._hotkey_next_sig.emit)
-            except: pass
+            _add(self.settings.hotkey_next_raw, self._hotkey_next_sig.emit)
         if self.settings.hotkey_prev_raw:
-            try: keyboard.add_hotkey(self.settings.hotkey_prev_raw, self._hotkey_prev_sig.emit)
-            except: pass
+            _add(self.settings.hotkey_prev_raw, self._hotkey_prev_sig.emit)
         if self.settings.hotkey_stop_raw:
-            try: keyboard.add_hotkey(self.settings.hotkey_stop_raw, self._hotkey_stop_sig.emit)
-            except: pass
+            _add(self.settings.hotkey_stop_raw, self._hotkey_stop_sig.emit)
+
+        if self._sc_hotkey_map:
+            def _global_sc_hook(ev):
+                sc = ev.scan_code
+                if not sc:
+                    return
+                if ev.event_type == 'down':
+                    self._pressed_sc.add(sc)
+                    fs = frozenset(self._pressed_sc)
+                    # Срабатываем ровно один раз пока комбо зажато
+                    if fs in self._sc_hotkey_map and fs != self._last_fired_sc:
+                        self._last_fired_sc = fs
+                        self._sc_hotkey_map[fs]()
+                elif ev.event_type == 'up':
+                    self._pressed_sc.discard(sc)
+                    if not self._pressed_sc:
+                        self._last_fired_sc = frozenset()  # сброс — можно нажать снова
+
+            keyboard.hook(_global_sc_hook)
 
     def _on_sound_hotkey(self, idx):
-        if idx>=len(self.sounds): return
-        s=self.sounds[idx]
-        if self.router.is_playing(s.path): self.router.stop_sound_by_path(s.path)
-        else: self.router.stop_all_sounds(); self.router.play_sound(s.path, s.volume, s.start_sec, s.end_sec)
+        """Global hotkey handler — always plays regardless of active folder view."""
+        if idx >= len(self.sounds): return
+        s = self.sounds[idx]
+        if self.router.is_playing(s.path):
+            self.router.stop_sound_by_path(s.path)
+        else:
+            threading.Thread(
+                target=self._play_with_stop,
+                args=(idx,),
+                daemon=True
+            ).start()
 
     def _on_folder_hotkey(self, idx, folder):
-        if idx>=len(self.sounds): return
-        s=self.sounds[idx]
+        """Folder-scoped hotkey — only fires when that folder view is active."""
+        if idx >= len(self.sounds): return
         if self._active_type != ITEM_FOLDER or self._active_folder != folder:
             return
-        if self.router.is_playing(s.path): self.router.stop_sound_by_path(s.path)
-        else: self.router.stop_all_sounds(); self.router.play_sound(s.path, s.volume, s.start_sec, s.end_sec)
+        s = self.sounds[idx]
+        if self.router.is_playing(s.path):
+            self.router.stop_sound_by_path(s.path)
+        else:
+            threading.Thread(
+                target=self._play_with_stop,
+                args=(idx,),
+                daemon=True
+            ).start()
+
+    def _play_with_stop(self, idx):
+        """
+        Background helper: stop everything, wait for the audio device to
+        fully release, then start the new sound.  Running in a daemon thread
+        keeps the UI responsive during the short wait.
+        """
+        # Snapshot the sound now; the list could change while we sleep.
+        if idx >= len(self.sounds):
+            return
+        s = self.sounds[idx]
+
+        # Serialise concurrent stop+play calls so rapid hotkey/click combos
+        # don't race each other onto the audio device.
+        with self.router._play_serial_lock:
+            self.router.stop_all_and_wait(0.10)
+            # Re-validate after the wait (user may have deleted the sound).
+            if idx < len(self.sounds):
+                self.router.play_sound(s.path, s.volume, s.start_sec, s.end_sec)
 
     def _visible_sounds(self) -> List[Tuple[int, Sound]]:
         if self._active_type == ITEM_ALL:
@@ -1101,34 +1224,37 @@ class SoundpadApp(QMainWindow):
 
     def _play_next(self):
         threading.Thread(target=self._play_next_thread, daemon=True).start()
+
     def _play_prev(self):
         threading.Thread(target=self._play_prev_thread, daemon=True).start()
 
     def _play_next_thread(self):
-        vis=self._visible_sounds()
+        vis = self._visible_sounds()
         if not vis: return
         playing_idx = next((gi for gi, s in vis if self.router.is_playing(s.path)), None)
-        self.router.stop_all_and_wait(0.12)
-        if playing_idx is None:
-            target_gi = vis[0][0]
-        else:
-            pos = next((i for i,(gi,_) in enumerate(vis) if gi==playing_idx), 0)
-            target_gi = vis[(pos+1) % len(vis)][0]
-        s=self.sounds[target_gi]
-        self.router.play_sound(s.path, s.volume, s.start_sec, s.end_sec)
+        with self.router._play_serial_lock:
+            self.router.stop_all_and_wait(0.10)
+            if playing_idx is None:
+                target_gi = vis[0][0]
+            else:
+                pos = next((i for i, (gi, _) in enumerate(vis) if gi == playing_idx), 0)
+                target_gi = vis[(pos + 1) % len(vis)][0]
+            s = self.sounds[target_gi]
+            self.router.play_sound(s.path, s.volume, s.start_sec, s.end_sec)
 
     def _play_prev_thread(self):
-        vis=self._visible_sounds()
+        vis = self._visible_sounds()
         if not vis: return
         playing_idx = next((gi for gi, s in vis if self.router.is_playing(s.path)), None)
-        self.router.stop_all_and_wait(0.12)
-        if playing_idx is None:
-            target_gi = vis[-1][0]
-        else:
-            pos = next((i for i,(gi,_) in enumerate(vis) if gi==playing_idx), 0)
-            target_gi = vis[(pos-1) % len(vis)][0]
-        s=self.sounds[target_gi]
-        self.router.play_sound(s.path, s.volume, s.start_sec, s.end_sec)
+        with self.router._play_serial_lock:
+            self.router.stop_all_and_wait(0.10)
+            if playing_idx is None:
+                target_gi = vis[-1][0]
+            else:
+                pos = next((i for i, (gi, _) in enumerate(vis) if gi == playing_idx), 0)
+                target_gi = vis[(pos - 1) % len(vis)][0]
+            s = self.sounds[target_gi]
+            self.router.play_sound(s.path, s.volume, s.start_sec, s.end_sec)
 
     # ─── UI BUILD ────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -1423,7 +1549,6 @@ class SoundpadApp(QMainWindow):
         self._clear_detail()
         s=self.sounds[idx]
 
-        # Row 1: name + action buttons
         row1=QHBoxLayout()
         self._detail_name_lbl=QLabel(s.name); self._detail_name_lbl.setFont(QFont("Segoe UI",13,QFont.Weight.Bold))
         self._detail_name_lbl.setStyleSheet(f"color:{T.TEXT};"); row1.addWidget(self._detail_name_lbl)
@@ -1443,7 +1568,6 @@ class SoundpadApp(QMainWindow):
 
         pl=QLabel(s.path); pl.setStyleSheet(f"color:{T.TEXTD};font-size:10px;"); self.detail_lay.addWidget(pl)
 
-        # Row 2: volume + global hotkey
         row2=QHBoxLayout(); row2.setSpacing(12)
         row2.addWidget(self._dim_lbl(tr("volume")))
         vol_sl=QSlider(Qt.Orientation.Horizontal); vol_sl.setRange(0,100); vol_sl.setValue(int(s.volume*100)); vol_sl.setFixedWidth(100)
@@ -1465,7 +1589,6 @@ class SoundpadApp(QMainWindow):
         row2.addStretch()
         w2=QWidget(); w2.setLayout(row2); self.detail_lay.addWidget(w2)
 
-        # Folder-specific hotkey – show only if context_folder is provided and sound belongs to it
         if context_folder and s.has_folder(context_folder):
             fhk_display, fhk_raw = s.get_folder_hotkey(context_folder)
             row = QHBoxLayout(); row.setSpacing(12)
@@ -1544,11 +1667,19 @@ class SoundpadApp(QMainWindow):
         self._build_detail(idx, context)
         self._toggle_sound(idx)
 
-    def _toggle_sound(self,idx):
-        if idx>=len(self.sounds): return
-        s=self.sounds[idx]
-        if self.router.is_playing(s.path): self.router.stop_sound_by_path(s.path)
-        else: self.router.stop_all_sounds(); self.router.play_sound(s.path,s.volume,s.start_sec,s.end_sec)
+    def _toggle_sound(self, idx):
+        """Toggle playback: stop if playing, otherwise stop-all then play."""
+        if idx >= len(self.sounds):
+            return
+        s = self.sounds[idx]
+        if self.router.is_playing(s.path):
+            self.router.stop_sound_by_path(s.path)
+        else:
+            threading.Thread(
+                target=self._play_with_stop,
+                args=(idx,),
+                daemon=True
+            ).start()
 
     def _add_sounds(self):
         paths,_=QFileDialog.getOpenFileNames(self,tr("select_audio"),"",tr("audio_files"))
